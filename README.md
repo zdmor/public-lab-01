@@ -6,4 +6,7 @@
 - [项目组合状态同步](https://github.com/zdmor/public-lab-01/issues/2)
 - [Desktop Commander 与 AI Remote Bridge 研究](https://github.com/zdmor/public-lab-01/issues/3)
 
+
+- [价格行为四层决策体系 V0.1｜公开研究文件](research/price-action-context-v0.1/README.md) · [公开讨论与评论 #6](https://github.com/zdmor/public-lab-01/issues/6)
+
 公开内容仅包含适合公开的摘要与证据，不放凭据、私人路径或业务敏感资料。
