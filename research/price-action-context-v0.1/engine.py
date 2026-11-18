@@ -10,7 +10,7 @@ from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from datetime import date
 from typing import Optional
 
-VERSION = "PA_CONTEXT_V0_1_1_RESEARCH"   # V0.1.1: Issue #6 review fixes, see SPEC.md section 10
+VERSION = "PA_CONTEXT_V0_1_2_RESEARCH"   # change log: SPEC.md section 10
 
 def _iso_day(value: str) -> bool:
     try:
@@ -376,12 +376,15 @@ def replay_ohlc(plan: dict, future: list[Bar], move_to_breakeven: bool = False,
                 max_wait_bars: Optional[int] = None, t_plus_one: bool = False) -> dict:
     """Conservative BAR-LEVEL illustrative replay, not a broker fill simulator.
     Any competing entry/stop or stop/target event in one OHLC bar -> AMBIGUOUS.
-    BE is effective NEXT bar after an observed 1R excursion.
-    max_wait_bars: a pending plan expires after that many bars without entry (IMPLEMENTATION).
+    BE is effective NEXT bar after an observed 1R excursion (a breakout's entry bar counts).
+    max_wait_bars: a pending plan expires when that many bars complete without entry (IMPLEMENTATION).
     t_plus_one: a LONG opened on a bar cannot be closed on that bar (A-share rule).
     """
     if plan["status"] != "PLAN":
         return {"status": "REJECT", "reason": "PLAN_NOT_VALID"}
+    if max_wait_bars is not None and (isinstance(max_wait_bars, bool) or not isinstance(max_wait_bars, int)
+                                      or max_wait_bars < 1):
+        raise ValueError("INVALID_MAX_WAIT_BARS")
     side, entry, stop, target = [plan[k] for k in
         ("side", "entry_price", "stop_price", "target_price")]
     mode = plan["entry_mode"]
@@ -396,8 +399,6 @@ def replay_ohlc(plan: dict, future: list[Bar], move_to_breakeven: bool = False,
         stopped = (b.low <= stop) if side == "LONG" else (b.high >= stop)
         won = (b.high >= target) if side == "LONG" else (b.low <= target)
         if not active:
-            if max_wait_bars is not None and waited >= max_wait_bars:
-                return {"status": "EXPIRED", "reason": "ENTRY_WINDOW_ELAPSED", "date": b.date}
             if mode == "RETRACE_50_618":
                 # A resting limit opened through is filled at the open, not at the
                 # planned price (SPEC 5.4 item 6); an open beyond the stop cancels.
@@ -411,6 +412,9 @@ def replay_ohlc(plan: dict, future: list[Bar], move_to_breakeven: bool = False,
                             "reason": "STRUCTURAL_INVALIDATION_BEFORE_ENTRY",
                             "date": b.date}
                 waited += 1
+                if max_wait_bars is not None and waited >= max_wait_bars:
+                    # The window closes when the last allowed bar completes without entry.
+                    return {"status": "EXPIRED", "reason": "ENTRY_WINDOW_ELAPSED", "date": b.date}
                 continue
             # T+1: a long opened on this bar cannot reach its target exit on it.
             if stopped or (won and not (t_plus_one and side == "LONG")):
@@ -420,6 +424,12 @@ def replay_ohlc(plan: dict, future: list[Bar], move_to_breakeven: bool = False,
                 return {"status": "UNKNOWN", "reason": "GAP_THROUGH_ENTRY", "date": b.date}
             active = True
             previous = b
+            # On a breakout's entry bar the further excursion follows the trigger, so a
+            # 1R move there is observed after entry: breakeven applies from the NEXT bar.
+            # A retrace limit cannot order the bar's extremes, so it is not applied.
+            if move_to_breakeven and mode == "BREAK_EXTREME" and (
+                    b.high >= entry + initial_risk if side == "LONG" else b.low <= entry - initial_risk):
+                stop = entry
             # entry is only a theoretical trigger, actual opening gaps/slippage unknown
             continue
         if stopped and won:
