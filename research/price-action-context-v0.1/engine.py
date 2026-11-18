@@ -10,7 +10,7 @@ from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from datetime import date
 from typing import Optional
 
-VERSION = "PA_CONTEXT_V0_1_RESEARCH"
+VERSION = "PA_CONTEXT_V0_1_1_RESEARCH"   # V0.1.1: Issue #6 review fixes, see SPEC.md section 10
 
 def _iso_day(value: str) -> bool:
     try:
@@ -58,6 +58,7 @@ class Config:
     minimum_rr: float = 2.0              # ARTICLE
     retrace_min: float = .50             # ARTICLE
     retrace_max: float = .618            # ARTICLE
+    engulf_cover_range: bool = False     # IMPLEMENTATION: also require high/low coverage
 
     def __post_init__(self):
         if self.tick <= 0 or self.swing_left < 1 or self.swing_right < 1:
@@ -136,13 +137,17 @@ def patterns(prev: Bar, now: Bar, c: Config) -> set[str]:
         out.add("PIN_BEAR")
     if now.high < prev.high and now.low > prev.low:
         out.add("INSIDE")
-    if (now.high >= prev.high and now.low <= prev.low and
-            now.close > now.open and prev.close < prev.open and
-            abs(now.close-now.open) > abs(prev.close-prev.open)):
+    # Real body must cover the previous real body; also covering the previous
+    # high/low is an optional, stricter reading (IMPLEMENTATION).
+    covers_range = now.high >= prev.high and now.low <= prev.low
+    larger_body = abs(now.close-now.open) > abs(prev.close-prev.open)
+    if (now.close > now.open and prev.close < prev.open and larger_body and
+            now.open <= prev.close and now.close >= prev.open and
+            (covers_range or not c.engulf_cover_range)):
         out.add("ENGULF_BULL")
-    if (now.high >= prev.high and now.low <= prev.low and
-            now.close < now.open and prev.close > prev.open and
-            abs(now.close-now.open) > abs(prev.close-prev.open)):
+    if (now.close < now.open and prev.close > prev.open and larger_body and
+            now.open >= prev.close and now.close <= prev.open and
+            (covers_range or not c.engulf_cover_range)):
         out.add("ENGULF_BEAR")
     return out
 
@@ -166,14 +171,17 @@ def confirmed_line(history: list[Bar], c: Config, kind: str) -> Optional[tuple[f
         slope=(value(i1)-value(i0))/(i1-i0)
         if slope <= 0:
             continue
-        contacts=[]
-        for idx in ids[start:]:
-            predicted=value(i0)+slope*(idx-i0)
-            if abs(value(idx)-predicted) <= tolerance:
-                contacts.append(idx)
-            else:
-                # A broken line cannot silently restart using old anchors.
-                break
+        def line(idx: int, i0: int = i0, slope: float = slope) -> float:
+            return value(i0)+slope*(idx-i0)
+        # Only a CLOSE beyond the line breaks it (SPEC 3.3: a pierce without a
+        # close is not a break); swing points on the far side are not contacts.
+        if kind == "SUPPORT":
+            broken = any(history[k].close < line(k)-tolerance for k in range(i0, len(history)))
+        else:
+            broken = any(history[k].close > line(k)+tolerance for k in range(i0, len(history)))
+        if broken:
+            continue
+        contacts=[idx for idx in ids[start:] if abs(value(idx)-line(idx)) <= tolerance]
         if len(contacts) < 3:
             continue
         # Only accept a line that remains current, not an old historical segment.
@@ -194,9 +202,10 @@ def inferred_range_edges(history: list[Bar], c: Config) -> Optional[tuple[float,
 
 def derive_levels(history: list[Bar], c: Config) -> list[Level]:
     hs, ls = pivot_points(history, c.swing_left, c.swing_right)
-    return ([Level(history[i].low, "SUPPORT", "PRIOR_CONFIRMED_PIVOT", history[i].date)
+    # A swing point is known only swing_right bars later: date the level then.
+    return ([Level(history[i].low, "SUPPORT", "PRIOR_CONFIRMED_PIVOT", history[i + c.swing_right].date)
              for i in ls] +
-            [Level(history[i].high, "RESISTANCE", "PRIOR_CONFIRMED_PIVOT", history[i].date)
+            [Level(history[i].high, "RESISTANCE", "PRIOR_CONFIRMED_PIVOT", history[i + c.swing_right].date)
              for i in hs])
 
 def nearest_level(signal: Bar, levels: list[Level], kind: str, tolerance: float) -> Optional[Level]:
@@ -205,10 +214,12 @@ def nearest_level(signal: Bar, levels: list[Level], kind: str, tolerance: float)
     return min(eligible, key=lambda x: (abs(x.price - signal.close), x.price)) if eligible else None
 
 def target_level(entry: float, levels: list[Level], side: str, signal_date: str) -> Optional[Level]:
+    # Nearest known level in the trade direction, whatever role it had when it
+    # formed: a broken support above a LONG entry is overhead supply.
     if side == "LONG":
-        valid = [x for x in levels if x.kind == "RESISTANCE" and x.price > entry and x.as_of <= signal_date]
+        valid = [x for x in levels if x.price > entry and x.as_of <= signal_date]
         return min(valid, key=lambda x: x.price) if valid else None
-    valid = [x for x in levels if x.kind == "SUPPORT" and x.price < entry and x.as_of <= signal_date]
+    valid = [x for x in levels if x.price < entry and x.as_of <= signal_date]
     return max(valid, key=lambda x: x.price) if valid else None
 
 def make_plan(signal: Bar, side: str, mode: str, target: Level, c: Config,
@@ -273,7 +284,8 @@ def evaluate_latest(bars: list[Bar], c: Config = Config(),
     tol = max(c.tick, c.level_tolerance_atr*a)
     levels = derive_levels(history, c) + (supplied_levels or [])
     # Reject future-sourced levels rather than silently looking ahead.
-    if any(x.as_of > signal.date for x in levels):
+    # A level dated the signal day itself may have been drawn after the signal bar.
+    if any(x.as_of >= signal.date for x in levels):
         return Assessment("UNKNOWN", "FUTURE_LEVEL", regime=regime)
     # Range-center signals are noise, but strong range BOUNDARIES remain eligible
     # (video #2 and article's resistance Doji case). Explicit boundaries are
@@ -360,10 +372,13 @@ def evaluate_latest(bars: list[Bar], c: Config = Config(),
                       regime, location, selected, side, plans)
 
 def replay_ohlc(plan: dict, future: list[Bar], move_to_breakeven: bool = False,
-                exit_on_opposite_engulf: bool = True, c: Config = Config()) -> dict:
+                exit_on_opposite_engulf: bool = True, c: Config = Config(),
+                max_wait_bars: Optional[int] = None, t_plus_one: bool = False) -> dict:
     """Conservative BAR-LEVEL illustrative replay, not a broker fill simulator.
     Any competing entry/stop or stop/target event in one OHLC bar -> AMBIGUOUS.
     BE is effective NEXT bar after an observed 1R excursion.
+    max_wait_bars: a pending plan expires after that many bars without entry (IMPLEMENTATION).
+    t_plus_one: a LONG opened on a bar cannot be closed on that bar (A-share rule).
     """
     if plan["status"] != "PLAN":
         return {"status": "REJECT", "reason": "PLAN_NOT_VALID"}
@@ -373,6 +388,7 @@ def replay_ohlc(plan: dict, future: list[Bar], move_to_breakeven: bool = False,
     initial_risk = abs(entry - stop)
     active = False
     previous: Optional[Bar] = None
+    waited = 0
     for b in future:
         enter = (b.high >= entry) if side == "LONG" and mode == "BREAK_EXTREME" else (
             (b.low <= entry) if side == "SHORT" and mode == "BREAK_EXTREME" else
@@ -380,13 +396,24 @@ def replay_ohlc(plan: dict, future: list[Bar], move_to_breakeven: bool = False,
         stopped = (b.low <= stop) if side == "LONG" else (b.high >= stop)
         won = (b.high >= target) if side == "LONG" else (b.low <= target)
         if not active:
+            if max_wait_bars is not None and waited >= max_wait_bars:
+                return {"status": "EXPIRED", "reason": "ENTRY_WINDOW_ELAPSED", "date": b.date}
+            if mode == "RETRACE_50_618":
+                # A resting limit opened through is filled at the open, not at the
+                # planned price (SPEC 5.4 item 6); an open beyond the stop cancels.
+                beyond_entry = b.open < entry if side == "LONG" else b.open > entry
+                beyond_stop = b.open <= stop if side == "LONG" else b.open >= stop
+                if beyond_entry and not beyond_stop:
+                    return {"status": "UNKNOWN", "reason": "GAP_THROUGH_ENTRY", "date": b.date}
             if not enter:
                 if stopped:
                     return {"status": "CANCELLED",
                             "reason": "STRUCTURAL_INVALIDATION_BEFORE_ENTRY",
                             "date": b.date}
+                waited += 1
                 continue
-            if stopped or won:
+            # T+1: a long opened on this bar cannot reach its target exit on it.
+            if stopped or (won and not (t_plus_one and side == "LONG")):
                 return {"status": "AMBIGUOUS", "reason": "ENTRY_AND_EXIT_WITHIN_SAME_BAR", "date": b.date}
             if mode == "BREAK_EXTREME" and ((side == "LONG" and b.open > entry) or
                                                (side == "SHORT" and b.open < entry)):
