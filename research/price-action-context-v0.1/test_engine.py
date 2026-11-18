@@ -1,10 +1,12 @@
 """Deterministic examples. Illustrative, NOT a backtest or realized trading proof."""
 import sys
 import unittest
+from datetime import date, timedelta
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from engine import (Bar, Level, Config, patterns, pivot_points, structure,
-                    make_plan, evaluate_latest, replay_ohlc, confirmed_line)
+                    make_plan, evaluate_latest, replay_ohlc, confirmed_line,
+                    derive_levels)
 
 C = Config()
 
@@ -142,6 +144,106 @@ class Tests(unittest.TestCase):
                                             replay_ohlc(p,[entry,target])["reason"]))
         nofill=Bar("2026-11-18",105,106,104,105)
         self.assertEqual("NOT_ENTERED", replay_ohlc(p,[nofill])["status"])
+
+
+# ---- V0.1.1: cases from the Issue #6 review (bar indices are 0-based) ----
+
+def _day(i, start=date(2026, 1, 1)):
+    return (start + timedelta(days=i)).isoformat()
+
+
+def _series(closes, spread):
+    return [Bar(_day(i), p, round(p + spread, 4), round(p - spread, 4), p) for i, p in enumerate(closes)]
+
+
+# Swing low 9.60 at index 3 is broken later (index 16 closes at 9.30); swing high 13.65 at index 9.
+BROKEN_SUPPORT = [10.4, 10.2, 9.95, 9.75, 10.1, 10.8, 11.5, 12.2, 12.9, 13.5,
+                  13.0, 12.3, 11.6, 10.9, 10.2, 9.6, 9.3]
+# Swing lows (window 1/1) 8.8 / 9.8 / 11.3 / 11.8 at indices 2 / 6 / 10 / 14.
+# 2, 6 and 14 lie on one rising line (slope 0.25); index 10 is a higher low above it.
+HIGHER_LOW_LINE = [9.6, 9.3, 9.0, 9.6, 10.4, 10.2, 10.0, 10.8, 11.8, 11.7,
+                   11.5, 12.3, 12.9, 12.4, 12.0, 12.6, 13.0]
+FLAT = [Bar(f"2026-01-{i:02d}", 10.5, 10.6, 10.4, 10.5) for i in range(1, 21)]
+VIDEO_SHORT = Bar("2026-11-17", 104, 110.49, 103.51, 103.9)
+
+
+class Issue6Review(unittest.TestCase):
+    def test_broken_support_is_an_overhead_obstacle(self):
+        # SPEC 5.3: the nearest level above a LONG entry caps the target,
+        # whether it formed as support or resistance.
+        hist = _series(BROKEN_SUPPORT, 0.15)
+        signal = Bar(_day(len(hist)), 9.25, 9.35, 8.70, 9.30)  # bullish pin touching 8.75
+        support = Level(8.75, "SUPPORT", "VERIFIED", hist[-1].date)
+        a = evaluate_latest(hist + [signal], supplied_levels=[support], regime_override="DOWN")
+        # V0.1: PLAN, both targets 13.65, gross RR 6.40 / 14.03
+        self.assertEqual({9.6}, {p["target_price"] for p in a.plans})
+        self.assertEqual(("REJECT", "NO_RR_GE_2"), (a.status, a.reason))
+
+    def test_retrace_entry_gapped_through_is_unknown(self):
+        # SPEC 5.4 item 6 also applies to RETRACE_50_618: sell limit 107, stop 110.5.
+        plan = make_plan(VIDEO_SHORT, "SHORT", "RETRACE_50_618",
+                         Level(89.5, "SUPPORT", "VIDEO", "2026-11-17"), C)
+        gap_then_stop = Bar("2026-11-18", 108.0, 111.0, 107.5, 110.8)  # V0.1: CANCELLED
+        gap_only = Bar("2026-11-18", 108.0, 108.5, 107.5, 108.2)       # V0.1: NOT_ENTERED
+        for bar in (gap_then_stop, gap_only):
+            r = replay_ohlc(plan, [bar])
+            self.assertEqual(("UNKNOWN", "GAP_THROUGH_ENTRY"), (r["status"], r["reason"]))
+
+    def test_trendline_allows_a_higher_low_between_touches(self):
+        # SPEC 3.3: three touches, no close below the line, a higher low in between.
+        line = confirmed_line(_series(HIGHER_LOW_LINE, 0.2), Config(swing_left=1, swing_right=1), "SUPPORT")
+        self.assertIsNotNone(line)  # V0.1: None
+        self.assertAlmostEqual(0.25, line[1])
+        self.assertEqual(3, line[2])
+        self.assertAlmostEqual(12.55, line[0])
+
+    def test_level_dated_on_the_signal_day_is_rejected(self):
+        # SPEC 2: a level dated the signal day may have been drawn after the signal bar.
+        signal = Bar("2026-01-21", 9.82, 9.92, 8.99, 9.9)
+        drawn = Level(8.99, "SUPPORT", "DRAWN_AT_SIGNAL_LOW", "2026-01-21")
+        resistance = Level(15.0, "RESISTANCE", "VERIFIED", "2026-01-20")
+        a = evaluate_latest(FLAT + [signal], supplied_levels=[drawn, resistance], regime_override="UP")
+        self.assertEqual(("UNKNOWN", "FUTURE_LEVEL"), (a.status, a.reason))  # V0.1: PLAN
+
+    def test_derived_level_is_dated_when_the_pivot_is_confirmed(self):
+        # SPEC 2: a swing point is known only swing_right bars after it.
+        hist = _series(BROKEN_SUPPORT, 0.15)
+        as_of = {(x.kind, x.price): x.as_of for x in derive_levels(hist, C)}
+        self.assertEqual(hist[3 + C.swing_right].date, as_of[("SUPPORT", 9.6)])  # V0.1: hist[3]
+        self.assertEqual(hist[9 + C.swing_right].date, as_of[("RESISTANCE", 13.65)])
+
+    def test_engulf_requires_body_cover_and_range_cover_is_optional(self):
+        # SPEC 4: the real body must cover the previous real body.
+        prev = Bar("2026-01-01", 10.5, 10.6, 9.9, 10.0)
+        body_not_covered = Bar("2026-01-02", 9.95, 10.6, 9.9, 10.46)  # V0.1: ENGULF_BULL
+        prev_long_wick = Bar("2026-01-01", 10.5, 11.2, 9.9, 10.0)
+        body_covered = Bar("2026-01-02", 9.95, 10.7, 9.9, 10.65)      # V0.1: not engulfing
+        self.assertNotIn("ENGULF_BULL", patterns(prev, body_not_covered, C))
+        self.assertIn("ENGULF_BULL", patterns(prev_long_wick, body_covered, C))
+        strict = Config(engulf_cover_range=True)
+        self.assertNotIn("ENGULF_BULL", patterns(prev_long_wick, body_covered, strict))
+
+    def test_entry_window_expires(self):
+        # SPEC 5.4 item 7: optional entry window.
+        signal = Bar("2026-01-21", 9.82, 9.92, 8.99, 9.9)
+        a = evaluate_latest(FLAT + [signal], regime_override="UP", supplied_levels=[
+            Level(9.0, "SUPPORT", "VERIFIED", "2026-01-20"),
+            Level(15.0, "RESISTANCE", "VERIFIED", "2026-01-20")])
+        quiet = [Bar(_day(i, date(2026, 1, 22)), 9.5, 9.8, 9.2, 9.5) for i in range(25)]
+        breakout = Bar(_day(25, date(2026, 1, 22)), 9.85, 10.2, 9.8, 10.1)
+        self.assertEqual("OPEN", replay_ohlc(a.plans[0], quiet + [breakout])["status"])
+        self.assertEqual("EXPIRED", replay_ohlc(a.plans[0], quiet + [breakout], max_wait_bars=3)["status"])
+
+    def test_t_plus_one_long_cannot_exit_on_entry_day(self):
+        # SPEC 5.4 item 8: A-share T+1 for longs.
+        signal = Bar("2026-11-17", 10.00, 10.20, 9.90, 10.15)
+        plan = make_plan(signal, "LONG", "BREAK_EXTREME", Level(10.90, "RESISTANCE", "TEST", "2026-11-16"), C)
+        entry_day = Bar("2026-11-18", 10.18, 10.95, 10.10, 10.80)  # trigger 10.21 and target 10.90 same day
+        next_day = Bar("2026-11-19", 10.85, 11.00, 10.70, 10.95)
+        self.assertEqual("AMBIGUOUS", replay_ohlc(plan, [entry_day, next_day])["status"])
+        r = replay_ohlc(plan, [entry_day, next_day], t_plus_one=True)
+        self.assertEqual(("EXIT", "TARGET", "2026-11-19"), (r["status"], r["reason"], r["date"]))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

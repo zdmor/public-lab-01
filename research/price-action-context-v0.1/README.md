@@ -13,7 +13,7 @@
 | --- | --- |
 | [SPEC.md](SPEC.md) | 中文体系规则、公式、完整价格行为案例、研究边界 |
 | [engine.py](engine.py) | Python 3.10+、无第三方依赖的计算引擎 |
-| [test_engine.py](test_engine.py) | 13项确定性测试，包括视频盈亏比、信号分类与防未来函数 |
+| [test_engine.py](test_engine.py) | 21项确定性测试（V0.1.1 新增 Issue #6 审阅的 8 项），包括视频盈亏比、信号分类与防未来函数 |
 
 ## 核心内容
 
