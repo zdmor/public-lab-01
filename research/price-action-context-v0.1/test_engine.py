@@ -244,6 +244,36 @@ class Issue6Review(unittest.TestCase):
         r = replay_ohlc(plan, [entry_day, next_day], t_plus_one=True)
         self.assertEqual(("EXIT", "TARGET", "2026-11-19"), (r["status"], r["reason"], r["date"]))
 
+    # ---- V0.1.2: findings of the Codex review on PR #7 ----
+
+    def test_entry_window_closes_with_the_last_allowed_bar(self):
+        # N quiet bars with max_wait_bars=N: already expired, no extra bar needed.
+        signal = Bar("2026-01-21", 9.82, 9.92, 8.99, 9.9)
+        a = evaluate_latest(FLAT + [signal], regime_override="UP", supplied_levels=[
+            Level(9.0, "SUPPORT", "VERIFIED", "2026-01-20"),
+            Level(15.0, "RESISTANCE", "VERIFIED", "2026-01-20")])
+        quiet = [Bar(_day(i, date(2026, 1, 22)), 9.5, 9.8, 9.2, 9.5) for i in range(3)]
+        r = replay_ohlc(a.plans[0], quiet, max_wait_bars=3)
+        self.assertEqual(("EXPIRED", quiet[-1].date), (r["status"], r["date"]))  # V0.1.1: NOT_ENTERED
+        self.assertEqual("NOT_ENTERED", replay_ohlc(a.plans[0], quiet[:2], max_wait_bars=3)["status"])
+        with self.assertRaises(ValueError):
+            replay_ohlc(a.plans[0], quiet, max_wait_bars=0)
+
+    def test_breakeven_counts_the_breakout_entry_bar(self):
+        # A 1R excursion on a breakout's entry bar follows the trigger: breakeven from the next bar.
+        signal = Bar("2026-11-17", 10.00, 10.20, 9.90, 10.15)
+        plan = make_plan(signal, "LONG", "BREAK_EXTREME",
+                         Level(10.90, "RESISTANCE", "TEST", "2026-11-16"), C)  # entry 10.21, stop 9.89
+        entry_day = Bar("2026-11-18", 10.18, 10.95, 10.10, 10.80)  # reaches the target, T+1 holds
+        pullback = Bar("2026-11-19", 10.30, 10.40, 10.00, 10.10)
+        r = replay_ohlc(plan, [entry_day, pullback], t_plus_one=True, move_to_breakeven=True)
+        self.assertEqual(("EXIT", "STOP", 10.21), (r["status"], r["reason"], r["theoretical_exit_price"]))  # V0.1.1: OPEN
+        far = make_plan(signal, "LONG", "BREAK_EXTREME", Level(11.50, "RESISTANCE", "TEST", "2026-11-16"), C)
+        one_r_day = Bar("2026-11-18", 10.18, 10.60, 10.10, 10.50)  # 1R = 10.53, target not reached
+        r = replay_ohlc(far, [one_r_day, pullback], move_to_breakeven=True)
+        self.assertEqual(("EXIT", "STOP", 10.21), (r["status"], r["reason"], r["theoretical_exit_price"]))
+        self.assertEqual("OPEN", replay_ohlc(far, [one_r_day, pullback])["status"])  # breakeven off
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
